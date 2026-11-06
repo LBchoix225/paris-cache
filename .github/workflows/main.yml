@@ -1,1 +1,58 @@
+import sqlite3, json, requests, datetime as dt, sys
+from concurrent.futures import ThreadPoolExecutor
 
+DAYS_BACK, DAYS_FWD = 14, 2
+LEAGUES = {
+ "nba":"basketball/nba","wnba":"basketball/wnba","ncaamb":"basketball/mens-college-basketball",
+ "ncaawb":"basketball/womens-college-basketball","nhl":"hockey/nhl","mlb":"baseball/mlb",
+ "nfl":"football/nfl","ncaafb":"football/college-football","atp":"tennis/atp","wta":"tennis/wta",
+ "ufc":"mma/ufc","epl":"soccer/eng.1","efl_champ":"soccer/eng.2","laliga":"soccer/esp.1",
+ "seriea":"soccer/ita.1","bundesliga":"soccer/ger.1","ligue1":"soccer/fra.1","ucl":"soccer/uefa.champions",
+ "uel":"soccer/uefa.europa","uecl":"soccer/uefa.europa.conf","mls":"soccer/usa.1","liga_pt":"soccer/por.1",
+ "eredivisie":"soccer/ned.1","brasileirao":"soccer/bra.1","liga_mx":"soccer/mex.1",
+ "rugby_premiership":"rugby/267979","cricket":"cricket/8039",
+}
+
+def fetch(args):
+    key, path, d = args
+    url = f"https://site.api.espn.com/apis/site/v2/sports/{path}/scoreboard?dates={d}&limit=300"
+    try:
+        r = requests.get(url, timeout=25); r.raise_for_status()
+        return key, r.json().get("events", []), None
+    except Exception as e:
+        return key, [], f"{key} {d}: {str(e)[:60]}"
+
+def main():
+    today = dt.datetime.now(dt.timezone.utc).date()
+    dates = [(today + dt.timedelta(days=i)).strftime("%Y%m%d") for i in range(-DAYS_BACK, DAYS_FWD + 1)]
+    jobs = [(k, p, d) for k, p in LEAGUES.items() for d in dates]
+    db = sqlite3.connect("cache.db")
+    db.execute("""CREATE TABLE IF NOT EXISTS events(league TEXT, id TEXT, date_utc TEXT, name TEXT,
+        home TEXT, away TEXT, state TEXT, home_score TEXT, away_score TEXT, odds_json TEXT,
+        PRIMARY KEY(league,id))""")
+    db.execute("CREATE TABLE IF NOT EXISTS meta(k TEXT PRIMARY KEY, v TEXT)")
+    n, errs = 0, []
+    with ThreadPoolExecutor(8) as ex:
+        for key, evs, err in ex.map(fetch, jobs):
+            if err: errs.append(err); continue
+            for e in evs:
+                try:
+                    c = e["competitions"][0]
+                    h = next(x for x in c["competitors"] if x.get("homeAway") == "home")
+                    a = next(x for x in c["competitors"] if x.get("homeAway") == "away")
+                    db.execute("INSERT OR REPLACE INTO events VALUES(?,?,?,?,?,?,?,?,?,?)", (
+                        key, e["id"], e["date"], e["name"], h["team"]["displayName"], a["team"]["displayName"],
+                        e["status"]["type"]["state"], h.get("score"), a.get("score"),
+                        json.dumps(c.get("odds", []))))
+                    n += 1
+                except Exception:
+                    pass
+    cutoff = (today - dt.timedelta(days=30)).isoformat()
+    db.execute("DELETE FROM events WHERE date_utc < ?", (cutoff,))
+    db.execute("INSERT OR REPLACE INTO meta VALUES('updated_utc', ?)", (dt.datetime.now(dt.timezone.utc).isoformat(),))
+    db.execute("INSERT OR REPLACE INTO meta VALUES('errors', ?)", (str(len(errs)),))
+    db.commit(); db.execute("VACUUM"); db.close()
+    print(f"{n} événements écrits, {len(errs)} erreurs")
+    if n == 0: sys.exit(1)
+
+main()
